@@ -14,9 +14,10 @@ The canonical design lives in the six design docs linked from [`PATHFINDER-AI-AU
 | P0    | Assistant handoff spike                | Complete    | [ai-authoring-0-assistant-spike.md](./phases/ai-authoring-0-assistant-spike.md) | _epic issue TBD_ |
 | P1    | CLI authoring foundation               | Complete    | [ai-authoring-1-cli-foundation.md](./phases/ai-authoring-1-cli-foundation.md)   | _epic issue TBD_ |
 | P2    | npm + Docker distribution              | Complete    | [ai-authoring-2-distribution.md](./phases/ai-authoring-2-distribution.md)       | _epic issue TBD_ |
-| P3    | TypeScript MCP server                  | Not started | _to be drafted at start_                                                        | _epic issue TBD_ |
+| P3    | TypeScript MCP server                  | Complete    | [ai-authoring-3-ts-mcp.md](./phases/ai-authoring-3-ts-mcp.md)                   | _epic issue TBD_ |
 | P4    | Assistant handoff and viewer link      | Not started | _to be drafted at start_                                                        | _epic issue TBD_ |
 | P5    | Existing-tool migration and follow-ups | Deferred    | —                                                                               | —                |
+| P6    | CDN repository tools (TS MCP)          | Not started | _to be drafted at start_                                                        | _epic issue TBD_ |
 
 Each row's "Detailed plan" cell is filled in when an agent runs the per-phase planning step and writes `docs/design/phases/ai-authoring-N-<slug>.md`.
 
@@ -51,6 +52,8 @@ P0 (spike) -----------------------+
 P1 (CLI) --> P2 (distribution) --+--> P3 (TS MCP) --> P4 (Assistant + link)
                                   |
                                   +--> P5 (deferred follow-ups)
+                                  |
+                                  +--> P6 (CDN repository tools)
 ```
 
 P0 is non-blocking until P4. P1 is the critical path for everything downstream. P2 lands before P3 because the TS MCP server is published as a second entrypoint of the same npm package the CLI ships in — once the package layout and publishing pipeline exist (P2), P3 adds the MCP entrypoint to it. There is no shell-out boundary, no bundled binary, and no plugin-tarball coupling.
@@ -156,7 +159,7 @@ The split is mechanical; the exit criterion above belongs to P1b.
 - Stateless artifact model — every mutation tool takes the artifact in and returns the artifact out. No `sessionId`, no server-side cache.
 - Two transports from one codebase:
   - **stdio** — the default for local MCP clients (Cursor, Claude Desktop, MCP Inspector). Trust-the-local-user auth model.
-  - **HTTP** — for centrally hosted deployment. Auth via the Grafana MCP token-verifier pattern (FastMCP `MultiAuth` + `GrafanaGoogleTokenVerifier`).
+  - **HTTP** — for centrally hosted deployment. **MVP ships without auth** (see [open question resolution](#does-the-hosted-http-mcp-need-auth-at-all)); abuse mitigations are edge rate-limiting, request size caps, and autoscaling ceilings. Auth is deferred to a later phase if usage patterns demand it.
 - Tools (per [`HOSTED-AUTHORING-MCP.md` — Core tools](./HOSTED-AUTHORING-MCP.md#core-tools)):
   - `pathfinder_authoring_start` — first tool, returns context + workflow + tutorial + discovery hints.
   - `pathfinder_help` — composes the same `--help --format json` surface the CLI exposes, as a function call.
@@ -220,14 +223,57 @@ Tracked here so they don't get lost; not scoped for the MVP.
 - Migrate Go MCP runtime tools to the TS package: `list_guides`, `get_guide`, `get_guide_schema`, `validate_guide_json`, `create_guide_template`. These are stateless and could move cleanly. `launch_guide` and the `pending-launch` queue stay in `pkg/plugin/mcp.go` indefinitely — they are coupled to per-instance frontend polling (`src/hooks/usePendingGuideLaunch.ts`) and genuinely belong in-process. Migration retires the hand-maintained Go schema summaries in `pkg/plugin/mcp.go` (`guideSchemas`).
 - `pathfinder-cli apply` batch command — collapse N mutations into one CLI invocation if it becomes useful for human authors. Originally motivated by amortizing Node cold-start across MCP tool calls, which no longer applies once the MCP imports the CLI directly. Re-evaluate against the human-authoring use case.
 - CRD extension to round-trip manifest fields, lighting up recommendation-engine parity for custom guides for both block-editor and AI-authored guides simultaneously.
+- **Server-side session state for the authoring artifact (deferred from P3).** The current stateless model passes the full `{content, manifest}` artifact in _and_ out of every mutation tool. Real multi-hop authoring runs on Cloud Run (2026-05-01) showed total wire bytes scaling roughly O(N²) in the number of hops — a 27-hop adversarial guide cost ~50× more agent-side tokens than a single-shot author of the same final artifact. Implementation notes for whoever picks this up:
+  - **Trigger.** Re-open this when (a) a real authoring run regularly exceeds ~30 hops, or (b) the agent host's per-tool-call payload limit becomes the binding constraint. Until then, the stateless design's debugging and fan-out properties outweigh the token win.
+  - **Shape.** Key the artifact by MCP `mcp-session-id`, hold it in process memory keyed off that id, and let mutation tools accept either `{artifact}` (current) or `{sessionId}` (new). Returning the full artifact stays as the default; an opt-in `returnDelta: true` flag returns just `{addedBlockId, manifestPatch?}` for cost-sensitive clients.
+  - **Eviction.** LRU with a hard cap (e.g. 128 sessions × 1 MB ≈ 128 MB per replica, well under the current `--memory=512Mi`). TTL on idle sessions (10 min) so a dropped client doesn't pin memory. Drop-on-`DELETE /mcp` plus drop-on-error.
+  - **Concurrency.** Per-session lock so concurrent mutations on one session serialize cleanly. Cross-replica is fine to _not_ solve — Cloud Run's `--concurrency=80` keeps a session sticky to one replica in practice; on miss the client gets `404 session_not_found` and falls back to passing the full artifact, same as today.
+  - **Observability.** Log `sessionId` (already present as the MCP transport header) plus `artifactBytesResident` so we can reason about retained-set size before tuning the cap.
+  - **What this does not solve.** The agent's _own_ context still grows hop-over-hop because each tool result is re-anchored in its prompt. The server-side cache shrinks the wire bytes but not the agent-side context. A meaningful fix to that requires the agent host to compress or summarize prior tool results, which is out of scope for this server.
+  - **Adjacent option (cheaper).** A `pathfinder_apply_ops` tool that takes an array of mutations and returns one final artifact would cut multi-hop cost ~10× without any server-side state. Worth shipping first, then revisit session state if it's still the bottleneck.
 
 The "long-lived Node sidecar" item from earlier drafts of this design is no longer applicable — the MCP server itself is a Node process, so there is no Go-Node bridge to optimize.
+
+---
+
+## P6 — CDN repository tools (TS MCP)
+
+**Goal.** Expose a small set of read-only tools on the TS MCP server that operate against the public Pathfinder package repository on the CDN (default: `https://interactive-learning.grafana.net/packages/`). Lets MCP clients discover, inspect, and deep-link to published packages without any per-instance Grafana plugin involvement.
+
+**Scope.**
+
+- New CDN client `src/cli/mcp/lib/repository-client.ts` — Node `fetch` against `repository.json` and per-package `content.json` / `manifest.json`. 60-second in-process TTL on `repository.json` only; per-package fetches are uncached. Repository base URL is read from `PATHFINDER_REPOSITORY_URL` (env var) with the CDN URL above as the default. Slash-normalization mirrors `buildPackageFileUrl` in `src/lib/package-recommendations-client.ts`.
+- New tool group `src/cli/mcp/tools/repository-tools.ts`, registered alongside the existing groups in `src/cli/mcp/tools/index.ts`. Stateless; no artifact in/out.
+- Tools:
+  - `pathfinder_list_packages` — list packages from `repository.json`. Optional filters: `type` (`guide`/`path`/`journey`), `category`, `q` (substring on title and description). Returns `{ baseUrl, packages: [...] }`.
+  - `pathfinder_get_package` — fetch full `content.json` + `manifest.json` for one package by `id`. Returns the raw JSON plus a non-fatal `validation` field (Zod parse result via `ContentJsonSchema` and `ManifestJsonObjectSchema.loose()`); schema drift does not hard-fail the tool.
+  - `pathfinder_get_manifest` — manifest-only fetch for one package by `id`. Cheaper variant for dependency / composition exploration.
+  - `pathfinder_launch_package` — construct the existing `?doc=<cdn-content-url>` deep link the Pathfinder app already understands (see `src/utils/find-doc-page.ts` case 2 — `interactive-learning.grafana.net` URLs are already accepted via `isInteractiveLearningUrl`). Returns a relative `launchPath` (`/a/grafana-pathfinder-app?doc=...`) plus an absolute `launchUrl` when the caller passes `instanceUrl`. Optional `panelMode: "floating"` matches `finalize.ts`.
+- Tests follow the pattern in `src/package-engine/online-cdn-resolver.test.ts` — mock `fetch` and exercise: filtered list, unknown id, malformed JSON (validation fallback), CDN 5xx, env var override, launch URL construction with and without `instanceUrl`, slash-normalization edges.
+- Docker image passes `PATHFINDER_REPOSITORY_URL` through unchanged (env vars flow through; no Dockerfile changes needed).
+
+**Out of scope.**
+
+- **The Go MCP server (`pkg/plugin/mcp.go`) is explicitly out of scope.** These tools are added to the TypeScript MCP server only. The Go endpoint is not extended, and no equivalent of these tools is added there. The existing P5 migration item (moving `list_guides` / `get_guide` / `get_guide_schema` / `validate_guide_json` / `create_guide_template` from Go to TS) is independent of P6 and remains deferred.
+- App-side changes — none needed; the `?doc=<interactive-learning.grafana.net URL>` deep-link pattern already works.
+- Multi-repository discovery, registry-scoped IDs, or anything from the [`PATHFINDER-PACKAGE-DESIGN.md`](./PATHFINDER-PACKAGE-DESIGN.md) Phase 7 work — P6 reads one repository, configured by env var.
+- Authentication on the CDN client — the repository is public.
+
+**Dependencies.** P3 (TS MCP server must exist before adding tools to it).
+
+**Exit criteria.**
+
+- An MCP client can call `pathfinder_list_packages`, `pathfinder_get_package`, `pathfinder_get_manifest`, and `pathfinder_launch_package` against the default CDN with no configuration.
+- Setting `PATHFINDER_REPOSITORY_URL` overrides the default, end-to-end (process env → tool → fetch URL).
+- `pathfinder_launch_package` returns a `launchPath` that, when appended to a Grafana instance origin, opens the targeted CDN guide in Pathfinder.
+- Schema drift in a CDN-hosted manifest does not hard-fail `pathfinder_get_package` or `pathfinder_get_manifest` — raw JSON is still returned alongside the validation issues.
+- `pkg/plugin/mcp.go` is unchanged.
 
 ## Cross-cutting concerns
 
 - **Schema is owned by the CLI, end to end.** Every phase preserves boundary decision 1: the MCP performs no schema validation of its own. With the MCP and CLI sharing one TypeScript runtime and one Zod schema instance, this is structurally enforced — not just a code-review check.
 - **One canonical ID.** P1 tightens the regex; P3's finalize tool and P4's Assistant handoff must use the same string verbatim — no transformation. Cross-checked at exit of P4.
-- **Stateless artifact model.** P3 must not introduce server-side session state. If a future need emerges, the trigger is documented in [`AUTHORING-SESSION-ARTIFACTS.md` — Open questions](./AUTHORING-SESSION-ARTIFACTS.md#open-questions).
+- **Stateless artifact model.** P3 must not introduce server-side session state. If a future need emerges, the trigger is documented in [`AUTHORING-SESSION-ARTIFACTS.md` — Open questions](./AUTHORING-SESSION-ARTIFACTS.md#open-questions). A concrete deferred-work entry exists in [P5 — Deferred follow-ups](#p5--deferred-follow-ups) with sizing data from the 2026-05-01 Cloud Run telemetry run.
 - **CLI and MCP ship in lockstep as one npm package.** Schema version is pinned to `CURRENT_SCHEMA_VERSION` via the P2 prepublish script, so the CLI and MCP entrypoints cannot publish at different versions. Plugin and MCP package releases are coordinated through CI but published independently — the plugin no longer carries the CLI binary, so plugin and CLI release cadences are decoupled.
 - **Server-provided context, not client-cached instructions.** P3 onward, agents must call `pathfinder_authoring_start` and follow server-provided guidance rather than carrying authoring instructions locally. Skill files for Cursor/Claude Desktop should remain thin.
 - **Assistant write-tool surface is a P4 coordination point** (from [P0 spike](./phases/ai-authoring-0-assistant-spike.md)). Assistant exposes no generic "call this App Platform path" tool today. P4 must pick a write-tool surface and coordinate with the Assistant team.
@@ -237,7 +283,15 @@ The "long-lived Node sidecar" item from earlier drafts of this design is no long
 
 ### Does the hosted HTTP MCP need auth at all?
 
-**Status.** Open. Decision needed before P3 HTTP transport lands.
+**Status.** Resolved 2026-04-30 — **Option 1: Open + edge rate-limiting for the MVP.** Auth is deferred. Re-evaluate if usage patterns or abuse warrant it; the decision is reversible since adding a token verifier later does not change the tool surface.
+
+**Why.** The MCP holds no privileged resource — Assistant performs the App Platform write with its own credentials in P4, and the tools wrap the open-source CLI anyone can `npx` locally. Shipping open preserves the OSS / airgapped story and removes a coordination dependency on the Assistant token surface. The dominant threat is cost (DoS), addressable with edge rate limits, request size caps, CPU/wallclock budgets, and autoscaling ceilings — none of which require an identity provider.
+
+**What this means for P3.** The HTTP transport ships without `MultiAuth` / `GrafanaGoogleTokenVerifier`. P3 plan should call out the rate-limit / size-cap / budget posture as the abuse-mitigation surface. The original auth context below is preserved for posterity and for any future re-evaluation.
+
+---
+
+**Original context (preserved for posterity):**
 
 **Context.** P3 scope currently specifies `MultiAuth + GrafanaGoogleTokenVerifier` on the HTTP transport, inherited from an earlier design where the MCP itself was going to write to App Platform. Under the current design that write is performed by the controlling agent (Grafana Assistant in P4), using _its_ credentials — the MCP itself touches no privileged resource. The tools are a stateless RPC wrapper around the same open-source CLI anyone can `npx` locally. So the original reason for auth (the MCP holding write capability) no longer applies.
 
@@ -264,4 +318,4 @@ The "long-lived Node sidecar" item from earlier drafts of this design is no long
 2. **Auth required, broad audience.** Accept any signed-in Grafana Cloud user (not just Assistant). Loses the airgapped story; gains attribution.
 3. **Both.** Anonymous tier with strict rate limits + authenticated tier with higher limits. More surface, more ops.
 
-This must be resolved before the P3 HTTP transport ships, since it determines the verifier configuration and the SLO/cost model for the hosted deployment.
+_Resolved — see status note at the top of this section._

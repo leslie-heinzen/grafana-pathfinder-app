@@ -30,11 +30,11 @@ const path = require('path');
 const REPO_ROOT = path.resolve(__dirname, '..');
 
 // CLI runtime imports — anything reachable at runtime from
-// dist/cli/cli/index.js or dist/cli/cli/mcp-placeholder.js.
+// dist/cli/cli/index.js or dist/cli/cli/mcp/index.js.
 // Keep this list minimal. If the Docker build fails with
 // "Cannot find module 'X'", either add X here or remove the
 // import from the CLI codepath.
-const RUNTIME_DEPS = ['commander', 'zod'];
+const RUNTIME_DEPS = ['commander', 'zod', '@modelcontextprotocol/sdk'];
 
 function readSchemaVersion() {
   const src = fs.readFileSync(path.join(REPO_ROOT, 'src/types/json-guide.schema.ts'), 'utf8');
